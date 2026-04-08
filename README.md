@@ -97,8 +97,8 @@ A separação permite:
 ## 🚀 Instalação
 
 ```bash
-git clone https://github.com/SEU-USUARIO/iagenix-finops.git
-cd iagenix-finops
+git clone https://github.com/brianmonteiro54/finops.git
+cd finops
 python3 -m venv .venv
 source .venv/bin/activate    # Linux/Mac
 # .venv\Scripts\activate     # Windows
@@ -125,7 +125,7 @@ python3 finops.py --profile producao --region us-west-2
 python3 finops.py --output relatorio-marco.html
 
 # Customizando tags obrigatórias (recursos sem essas tags são flagados)
-python3 finops.py --tag-keys cnj-env,Projeto,cnj-product
+python3 finops.py --tag-keys env,projeto,product
 
 # Salvando findings em JSON (para CI/pipelines)
 python3 finops.py --json findings.json
@@ -137,7 +137,7 @@ python3 finops.py --debug-sp
 python3 finops.py \
   --profile prod \
   --region sa-east-1 \
-  --tag-keys cnj-env,Projeto,cnj-product \
+  --tag-keys env,projeto,product \
   --output relatorio-prod-$(date +%Y%m%d).html \
   --json findings-prod.json
 ```
