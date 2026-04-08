@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Relatórios gerados (não commitar resultados)
+*.html
+*.json
+
+# AWS (nunca commitar credenciais!)
+.aws/
+credentials
