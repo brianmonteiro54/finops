@@ -127,7 +127,6 @@ class FinOpsSimulator:
             "cost_summary": {},
             "reserved_utilization": [],
             "savings_plans_utilization": [],
-            "savings_plans_history": {"months": [], "total_savings": 0},
             "ri_inventory": {},
             "ri_details": [],
             "sp_details": [],
@@ -428,7 +427,6 @@ class FinOpsSimulator:
 
         if total is None:
             print("      → Nenhum Savings Plan ativo nos períodos consultados (ou sem dados disponíveis)")
-            self._fetch_savings_plans_history()
             return
 
         util = total.get("Utilization", {})
@@ -457,142 +455,6 @@ class FinOpsSimulator:
             })
             self.findings["total_potential_savings"] += unused
         print(f"      → Savings Plans: {utilization_pct:.1f}% {status} ({source}, economia líquida: ${savings:,.2f})")
-        self._fetch_savings_plans_history()
-
-    def _fetch_savings_plans_history(self):
-        """Busca histórico mês a mês de economia REAL com Savings Plans (últimos 6 meses).
-
-        Usa o padrão correto AWS:
-        - Filter: RECORD_TYPE = SavingsPlanCoveredUsage (só linhas cobertas por SP)
-        - UnblendedCost = valor que seria pago on-demand (custo "fantasma")
-        - AmortizedCost = custo real do SP alocado a essa usage (já com upfront amortizado)
-        - Economia = Unblended - Amortized
-
-        Importante: NÃO inclui Reserved Instances. RIs têm RECORD_TYPE = DiscountedUsage,
-        que é filtrado fora. A coluna 'Custo com SP' representa o valor amortizado real
-        do SP (incluindo a parcela mensal do upfront em planos All/Partial Upfront)."""
-        today = datetime.now().date()
-        current_start = today.replace(day=1)
-        # 6 meses atrás
-        year = current_start.year
-        month = current_start.month - 6
-        while month <= 0:
-            month += 12
-            year -= 1
-        history_start = current_start.replace(year=year, month=month)
-
-        # MODO DEBUG: imprime breakdown completo por RECORD_TYPE pra comparar com console
-        if self.debug_sp:
-            print("\n" + "=" * 70)
-            print(" 🔍 DEBUG MODE - Savings Plans History")
-            print(" Janela: {} a {}".format(history_start, today))
-            print(" Filtro: RECORD_TYPE = SavingsPlanCoveredUsage")
-            print(" Métricas: UnblendedCost + AmortizedCost")
-            print("=" * 70)
-            try:
-                # Query 1: Breakdown completo por RECORD_TYPE (sem filtro) pra ver TUDO
-                resp_all = self.ce.get_cost_and_usage(
-                    TimePeriod={"Start": str(history_start), "End": str(today)},
-                    Granularity="MONTHLY",
-                    Metrics=["UnblendedCost", "AmortizedCost"],
-                    GroupBy=[{"Type": "DIMENSION", "Key": "RECORD_TYPE"}],
-                )
-                print("\n📋 BREAKDOWN POR RECORD_TYPE (sem filtro):")
-                print("-" * 70)
-                for result in resp_all.get("ResultsByTime", []):
-                    period = result["TimePeriod"]["Start"][:7]
-                    print(f"\n  {period}:")
-                    for grp in result.get("Groups", []):
-                        rt = grp["Keys"][0]
-                        unb = float(grp["Metrics"]["UnblendedCost"]["Amount"])
-                        amo = float(grp["Metrics"]["AmortizedCost"]["Amount"])
-                        # Marca records relacionados a SP/RI
-                        marker = ""
-                        if "SavingsPlan" in rt:
-                            marker = "  ← SP"
-                        elif rt in ("DiscountedUsage", "RIFee"):
-                            marker = "  ← RI"
-                        print(f"    {rt:35s}  Unblended: ${unb:>14,.2f}  Amortized: ${amo:>14,.2f}{marker}")
-            except ClientError as e:
-                print(f"  ⚠ Erro no debug: {e.response['Error']['Code']}")
-            print("\n" + "=" * 70 + "\n")
-
-        try:
-            # Query única com GroupBy por RECORD_TYPE - assim conseguimos ver
-            # CoveredUsage (Unblended e Amortized) E RecurringFee (Unblended)
-            # numa só chamada, e classificar mês a mês.
-            resp = self.ce.get_cost_and_usage(
-                TimePeriod={"Start": str(history_start), "End": str(today)},
-                Granularity="MONTHLY",
-                Metrics=["UnblendedCost", "AmortizedCost"],
-                Filter={
-                    "Dimensions": {
-                        "Key": "RECORD_TYPE",
-                        # Inclui tanto CoveredUsage (showback) quanto RecurringFee (cobrança real local)
-                        "Values": ["SavingsPlanCoveredUsage", "SavingsPlanRecurringFee", "SavingsPlanUpfrontFee"],
-                    }
-                },
-                GroupBy=[{"Type": "DIMENSION", "Key": "RECORD_TYPE"}],
-            )
-            monthly = []
-            total_on_demand = 0
-            total_sp_cost = 0
-            for result in resp.get("ResultsByTime", []):
-                period_start = result["TimePeriod"]["Start"]
-                period_label = datetime.strptime(period_start, "%Y-%m-%d").strftime("%b/%Y")
-                # Lê cada record type
-                covered_unblended = 0  # On-demand equivalente (showback)
-                covered_amortized = 0  # SP cost amortizado alocado a essa usage
-                recurring_fee_local = 0  # Fee de SP que ESTA conta efetivamente pagou
-                upfront_fee_local = 0  # Upfront pago por esta conta (geralmente só no mês da compra)
-                for grp in result.get("Groups", []):
-                    rt = grp["Keys"][0]
-                    unb = float(grp["Metrics"]["UnblendedCost"]["Amount"])
-                    amo = float(grp["Metrics"]["AmortizedCost"]["Amount"])
-                    if rt == "SavingsPlanCoveredUsage":
-                        covered_unblended = unb
-                        covered_amortized = amo
-                    elif rt == "SavingsPlanRecurringFee":
-                        recurring_fee_local = unb
-                    elif rt == "SavingsPlanUpfrontFee":
-                        upfront_fee_local = unb
-                # Classificação local vs externo:
-                # - Local: esta conta pagou alguma fee de SP esse mês (recurring ou upfront)
-                # - Externo: tem cobertura mas zero pagamento local → SP em outra conta (payer)
-                local_sp_paid = recurring_fee_local + upfront_fee_local
-                is_local = local_sp_paid > 0
-                # Economia SEMPRE calculada como Unblended - Amortized
-                # (representa a economia REAL do consumo, não importa quem pagou o SP)
-                savings = covered_unblended - covered_amortized
-                savings_pct = (savings / covered_unblended * 100) if covered_unblended > 0 else 0
-                if covered_unblended > 0 or covered_amortized > 0:
-                    monthly.append({
-                        "period": period_label,
-                        "on_demand_cost": round(covered_unblended, 2),
-                        "sp_cost": round(covered_amortized, 2),
-                        "savings": round(savings, 2),
-                        "savings_pct": round(savings_pct, 1),
-                        "local_sp_paid": round(local_sp_paid, 2),
-                        "is_local": is_local,
-                    })
-                    total_on_demand += covered_unblended
-                    total_sp_cost += covered_amortized
-            total_savings = total_on_demand - total_sp_cost
-            self.findings["savings_plans_history"] = {
-                "months": monthly,
-                "total_on_demand": round(total_on_demand, 2),
-                "total_sp_cost": round(total_sp_cost, 2),
-                "total_savings": round(total_savings, 2),
-                "total_savings_pct": round(total_savings / total_on_demand * 100, 1) if total_on_demand > 0 else 0,
-            }
-            if monthly:
-                avg_pct = (total_savings / total_on_demand * 100) if total_on_demand > 0 else 0
-                local_n = sum(1 for m in monthly if m["is_local"])
-                ext_n = len(monthly) - local_n
-                print(f"      → Histórico SP: {len(monthly)} meses ({local_n} local + {ext_n} externo), economia ${total_savings:,.2f} ({avg_pct:.1f}%)")
-        except ClientError as e:
-            print(f"      ⚠ Histórico SP indisponível: {e.response['Error']['Code']}")
-            self.findings["savings_plans_history"] = {"months": [], "total_savings": 0}
 
     # ------------------------------------------------------------------
     # 4) RESERVED INSTANCES POR SERVIÇO (inventário detalhado)
@@ -767,17 +629,69 @@ class FinOpsSimulator:
             })
 
         # Também busca Savings Plans com data de expiração
+        # Tenta múltiplos states pra capturar SPs em qualquer status (active, queued, etc)
         try:
-            sp_resp = self.savingsplans.describe_savings_plans(states=["active"]).get("savingsPlans", [])
+            all_sp_states = ["payment-pending", "payment-failed", "active", "retired", "queued", "queued-deleted"]
+            all_sps_raw = []
+            try:
+                # Tentativa 1: listar SEM filtro de state (pega todos)
+                resp = self.savingsplans.describe_savings_plans()
+                all_sps_raw = resp.get("savingsPlans", [])
+            except ClientError:
+                # Tentativa 2: filtrar só active (caso o sem-filtro dê erro)
+                resp = self.savingsplans.describe_savings_plans(states=["active"])
+                all_sps_raw = resp.get("savingsPlans", [])
+
+            if self.debug_sp:
+                print("\n" + "=" * 70)
+                print(" 🔍 DEBUG MODE - describe_savings_plans (TODOS os states)")
+                print("=" * 70)
+                if not all_sps_raw:
+                    print("\n  ⚠️  ZERO Savings Plans retornados pela API.")
+                    print("  Possíveis causas:")
+                    print("    1) Esta conta realmente não tem SPs próprios (cobertura vem da payer)")
+                    print("    2) Permissão savingsplans:DescribeSavingsPlans ausente")
+                    print("    3) SP foi comprado em outra Organization/conta consolidada")
+                    print("\n  Como confirmar manualmente: Console AWS desta conta →")
+                    print("    Cost Management → Savings Plans → Inventory")
+                    print("    Se aparecer SPs aí mas não no script = problema de permissão")
+                else:
+                    print(f"\n  Total SPs retornados: {len(all_sps_raw)}")
+                    for sp in all_sps_raw:
+                        print(f"\n  ID: {sp.get('savingsPlanId', '?')}")
+                        print(f"    State:           {sp.get('state', '?')}")
+                        print(f"    Type:            {sp.get('savingsPlanType', '?')}")
+                        print(f"    Payment:         {sp.get('paymentOption', '?')}")
+                        print(f"    Start:           {sp.get('start', '?')}")
+                        print(f"    End:             {sp.get('end', '?')}")
+                        print(f"    Commitment/h:    {sp.get('commitment', '?')}")
+                        print(f"    Upfront:         {sp.get('upfrontPaymentAmount', '?')}")
+                        print(f"    Recurring/h:     {sp.get('recurringPaymentAmount', '?')}")
+                print("\n" + "=" * 70 + "\n")
+
+            # Filtra apenas active pra usar no inventory (SPs ativos cobrindo workload agora)
+            sp_resp_active = [sp for sp in all_sps_raw if sp.get("state") == "active"]
             sp_details = []
-            for sp in sp_resp:
+            for sp in sp_resp_active:
                 end_str = sp.get("end")  # ISO string
+                start_str = sp.get("start")  # ISO string
                 end_dt = None
+                start_dt = None
                 if end_str:
                     try:
                         end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
                     except Exception:
                         pass
+                if start_str:
+                    try:
+                        start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+                # Se não temos start_dt mas temos end_dt + termo, calcula
+                if start_dt is None and end_dt is not None:
+                    term_secs = sp.get("termDurationInSeconds", 0)
+                    if term_secs:
+                        start_dt = end_dt - timedelta(seconds=term_secs)
                 days = _days_until(end_dt)
                 sp_details.append({
                     "id": sp.get("savingsPlanId", "?"),
@@ -785,12 +699,13 @@ class FinOpsSimulator:
                     "payment": sp.get("paymentOption", "?"),
                     "term_years": sp.get("termDurationInSeconds", 0) // (365*24*3600),
                     "commitment_hourly": sp.get("commitment", "?"),
+                    "start_date": start_dt.strftime("%Y-%m-%d") if start_dt else "?",
                     "end_date": end_dt.strftime("%Y-%m-%d") if end_dt else "?",
                     "days_remaining": days,
                     "status": _expiry_status(days),
                 })
             self.findings["sp_details"] = sp_details
-            print(f"      → Savings Plans ativos: {len(sp_details)}")
+            print(f"      → Savings Plans ativos nesta conta: {len(sp_details)} (de {len(all_sps_raw)} retornados pela API)")
             sp_expiring = [s for s in sp_details if s["days_remaining"] is not None and 0 <= s["days_remaining"] < 30]
             if sp_expiring:
                 self.findings["recommendations"].append({
@@ -800,7 +715,10 @@ class FinOpsSimulator:
                     "potential_savings": 0,
                 })
         except ClientError as e:
-            print(f"      ⚠ Savings Plans details: {e.response['Error']['Code']}")
+            code = e.response['Error']['Code']
+            print(f"      ⚠ Savings Plans details: {code}")
+            if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation"):
+                print(f"         💡 Verifique se o role tem a permissão savingsplans:DescribeSavingsPlans")
             self.findings["sp_details"] = []
 
     # ------------------------------------------------------------------
@@ -1238,7 +1156,6 @@ def generate_html_report(findings, output_path):
 
     ri_util = findings.get("reserved_utilization", [])
     sp_util = findings.get("savings_plans_utilization", [])
-    sp_history = findings.get("savings_plans_history", {"months": [], "total_savings": 0})
     idle = findings.get("idle_resources", [])
     untagged = findings.get("untagged_resources", [])
     recs = findings.get("recommendations", [])
@@ -1481,83 +1398,6 @@ def generate_html_report(findings, output_path):
           <p style="color:#8b949e;font-size:1.1em;margin-bottom:15px">⭕ Nenhum Savings Plan ativo detectado</p>
           <p style="color:#ffa657">💡 <strong>Oportunidade:</strong> Compute Savings Plans podem reduzir até 66% vs On-Demand para workloads EC2/Fargate/Lambda estáveis.</p>
         </div>"""
-
-    # -------- Extrato histórico Savings Plans (cards mensais) --------
-    sp_months = sp_history.get("months", [])
-    # A classificação local vs externo agora vem direto da API:
-    # - is_local=True quando esta conta pagou SavingsPlanRecurringFee/UpfrontFee no mês
-    # - is_local=False quando há cobertura mas zero pagamento local (SP em conta payer/org)
-
-    # Verifica se algum mês tem cobertura mas SEM pagamento local detectado (= origem externa)
-    has_external_origin = any(
-        m["on_demand_cost"] > 0 and not m.get("is_local", False)
-        for m in sp_months
-    )
-
-    sp_history_intro = ""
-    if has_external_origin and sp_months:
-        sp_history_intro = """
-        <details class="expandable" style="margin-bottom:15px">
-          <summary style="color:#ffa657">🔗 Cobertura externa detectada — clique para entender</summary>
-          <div style="padding:14px 18px;font-size:.92em;line-height:1.6;color:#c9d1d9">
-            Os meses marcados com <span class="origin-badge external">🔗 SP externo</span> são cobertos por um Savings Plan em <strong>outra conta</strong> (geralmente a payer da Organization). Esta conta pagou <strong>$0 de fee de SP</strong> nesses meses — a "economia" mostrada é apenas <strong>showback contábil</strong>, não dinheiro que entrou aqui. Pode desaparecer se a payer não renovar o SP.
-          </div>
-        </details>"""
-
-    sp_history_html = sp_history_intro
-    for m in sp_months:
-        is_local = m.get("is_local", False)
-        local_paid = m.get("local_sp_paid", 0)
-        if is_local:
-            badge_html = f'<span class="origin-badge local">✅ SP nesta conta (paguei ${local_paid:,.2f})</span>'
-        else:
-            badge_html = '<span class="origin-badge external">🔗 SP externo (paguei $0)</span>'
-        border_color = "#b388ff" if is_local else "#ffa657"
-        sp_history_html += f"""
-        <div class="sp-month-card" style="border-left-color:{border_color}">
-          <div class="sp-month-header">
-            <h3>{m['period']}</h3>
-            {badge_html}
-          </div>
-          <div class="cost-line"><span>Custo On-Demand (sem SP):</span><span>${m['on_demand_cost']:,.2f}</span></div>
-          <div class="cost-line"><span>Custo com Savings Plans (amortizado):</span><span style="color:#b388ff">${m['sp_cost']:,.2f}</span></div>
-          <div class="cost-line cost-line-total"><span><strong>ECONOMIA:</strong></span><span style="color:#00e68a"><strong>${m['savings']:,.2f} ({m['savings_pct']:.1f}%)</strong></span></div>
-        </div>"""
-    if sp_months:
-        total_od = sp_history.get('total_on_demand', 0)
-        total_sp = sp_history.get('total_sp_cost', 0)
-        total_sv = sp_history.get('total_savings', 0)
-        total_pct = sp_history.get('total_savings_pct', 0)
-        local_count = sum(1 for m in sp_months if m.get("is_local", False))
-        external_count = len(sp_months) - local_count
-        local_savings = sum(m["savings"] for m in sp_months if m.get("is_local", False))
-        external_savings = sum(m["savings"] for m in sp_months if not m.get("is_local", False))
-        composition = ""
-        if external_count > 0 and local_count > 0:
-            composition = f"""
-            <div style='margin-top:12px;padding:10px;background:rgba(0,0,0,0.2);border-radius:6px;font-size:.88em;line-height:1.7'>
-              <strong style='color:#00e68a'>✅ Sua economia REAL ({local_count} mês{'es' if local_count > 1 else ''}):</strong> ${local_savings:,.2f}<br>
-              <strong style='color:#ffa657'>🔗 Showback de SP externo ({external_count} mês{'es' if external_count > 1 else ''}):</strong> ${external_savings:,.2f}
-              <span style='color:#8b949e;font-size:.92em'>(não conte como sua)</span>
-            </div>"""
-        elif external_count > 0:
-            composition = f"""
-            <div style='margin-top:12px;padding:10px;background:rgba(255,166,87,0.1);border-left:3px solid #ffa657;border-radius:6px;font-size:.88em;line-height:1.7'>
-              <strong style='color:#ffa657'>⚠️ TODA a economia mostrada é showback de SP em outra conta</strong> — você efetivamente pagou <strong>$0.00 de fee de SP</strong> nesses {external_count} meses.
-              A "economia" de ${total_sv:,.2f} é alocação contábil da AWS, não dinheiro que entrou no seu bolso.
-            </div>"""
-        elif local_count > 0:
-            composition = f"<div style='margin-top:8px;font-size:.88em;color:#00e68a'>✅ Toda a economia veio de SPs comprados nesta conta — economia REAL.</div>"
-        sp_history_html += f"""
-        <div class="sp-month-card sp-total">
-          <h3>💰 TOTAL ACUMULADO ({len(sp_months)} meses)</h3>
-          <div class="cost-line"><span>Custo On-Demand (sem SP):</span><span>${total_od:,.2f}</span></div>
-          <div class="cost-line"><span>Custo com Savings Plans (amortizado):</span><span style="color:#b388ff">${total_sp:,.2f}</span></div>
-          <div class="cost-line cost-line-total"><span style="font-size:1.2em"><strong>ECONOMIA TOTAL:</strong></span><span style="color:#00e68a;font-size:1.2em"><strong>${total_sv:,.2f} ({total_pct:.1f}%)</strong></span></div>
-          {composition}
-        </div>"""
-    else:
-        sp_history_html = '<p style="color:#8b949e;text-align:center;padding:20px">Sem histórico de Savings Plans disponível nos últimos 6 meses.</p>'
 
     # -------- Recursos ociosos agrupados --------
     idle_by_type = {}
@@ -2145,16 +1985,6 @@ tr:hover{{background:rgba(26,35,50,.5)}}
 .sp-metric{{background:#1a2332;padding:15px;border-radius:10px;text-align:center}}
 .sp-label{{color:#8b949e;font-size:.82em;margin-bottom:5px}}
 .sp-value{{font-size:1.3em;font-weight:700}}
-.sp-history-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:15px;margin-top:15px}}
-.sp-month-card{{background:#1a2332;border-radius:10px;padding:18px;border-left:4px solid #b388ff}}
-.sp-month-card h3{{color:#b388ff;margin-bottom:12px;font-size:1em}}
-.sp-month-header{{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px}}
-.sp-month-header h3{{margin-bottom:0}}
-.origin-badge{{display:inline-block;padding:3px 10px;border-radius:12px;font-size:.72em;font-weight:700;text-transform:uppercase;letter-spacing:.3px}}
-.origin-badge.local{{background:rgba(0,230,138,0.18);color:#00e68a;border:1px solid rgba(0,230,138,0.4)}}
-.origin-badge.external{{background:rgba(255,166,87,0.18);color:#ffa657;border:1px solid rgba(255,166,87,0.4)}}
-.sp-month-card.sp-total{{border-left-color:#00e68a;background:rgba(0,230,138,.05);grid-column:1/-1}}
-.sp-month-card.sp-total h3{{color:#00e68a}}
 
 /* Idle resources */
 .idle-group{{background:#1a2332;border-radius:10px;padding:20px;margin-bottom:15px;border-left:4px solid #ffa657}}
@@ -2252,7 +2082,6 @@ details.expandable table{{margin:0;padding:0 15px 15px 15px}}
 <!-- LINHA 2: Savings Plans + Quick stats -->
 <div class="summary-cards">
   <div class="card"><h3>💳 Savings Plans (mês)</h3><div class="value orange">${sp_monthly_total:,.2f}</div><div style="font-size:.82em;color:#8b949e;margin-top:4px">Economia líquida</div></div>
-  <div class="card" style="background:rgba(0,230,138,.08);border-color:rgba(0,230,138,.4)"><h3>💰 Economia SP Acumulada</h3><div class="value green">${sp_history.get('total_savings',0):,.2f}</div><div style="font-size:.82em;color:#8b949e;margin-top:4px">{len(sp_months)} meses — {sp_history.get('total_savings_pct',0):.1f}% vs On-Demand</div></div>
   <div class="card"><h3>📦 Reservas Ativas</h3><div class="value">{total_ris}</div></div>
   <div class="card"><h3>🚨 Recursos Ociosos</h3><div class="value red">{len(idle)}</div><div style="font-size:.82em;color:#8b949e;margin-top:4px">${total_idle_cost:,.2f}/mês</div></div>
   <div class="card"><h3>💡 Recomendações</h3><div class="value">{len(all_recs)}</div><div style="font-size:.82em;color:#8b949e;margin-top:4px">{len(recs)} críticas + {len(best_practices)} práticas</div></div>
@@ -2308,13 +2137,6 @@ details.expandable table{{margin:0;padding:0 15px 15px 15px}}
     * <strong>Variação:</strong> <span style="color:{var_color}">{var_sign}${total_variation:,.2f} ({var_sign}{total_variation_pct:.2f}%)</span><br>
     * <strong>⚠️ Dados estimados</strong> — a AWS pode fazer ajustes retroativos até o fechamento do mês.
   </div>
-</div>
-
-<!-- EXTRATO SAVINGS PLANS -->
-<div class="executive-summary">
-  <h2>💳 Extrato Detalhado - Savings Plans (últimos 6 meses)</h2>
-  <p style="color:#8b949e;margin-bottom:15px;font-size:.9em">Comparativo mês a mês entre o custo on-demand coberto pelo SP e o custo efetivamente pago. Mostra a economia real vs cenário sem reservas.</p>
-  <div class="sp-history-grid">{sp_history_html}</div>
 </div>
 
 <!-- INVENTÁRIO DE RESERVAS -->
